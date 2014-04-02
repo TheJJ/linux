@@ -97,6 +97,16 @@ config KVM_DEVICE_ASSIGNMENT
 
 	  If unsure, say N.
 
+config KVM_XTIER
+	bool "XTIER code injection"
+	depends on KVM && KVM_INTEL
+	---help---
+	  Enables support for code injection into virtual machines.
+	  This can be used for virtual machine introspection (VMI) for in-band
+	  view generation.
+
+	  If unsure, say N.
+
 # OK, it's a little counter-intuitive to do this, but it puts it neatly under
 # the virtualization menu.
 source drivers/vhost/Kconfig

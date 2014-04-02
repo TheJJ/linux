@@ -28,6 +28,7 @@
 
 #include <linux/kvm.h>
 #include <linux/kvm_para.h>
+#include <linux/xtier.h>
 
 #include <linux/kvm_types.h>
 
@@ -272,6 +273,11 @@ struct kvm_vcpu {
 		bool dy_eligible;
 	} spin_loop;
 #endif
+
+#ifdef CONFIG_KVM_XTIER
+	struct xtier_vm xtier;
+#endif
+
 	bool preempted;
 	struct kvm_vcpu_arch arch;
 };

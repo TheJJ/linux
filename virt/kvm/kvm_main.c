@@ -63,8 +63,16 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/kvm.h>
 
+#include <linux/xtier.h>
+
+#include "x-tier/kvm.h"
+#include "x-tier/inject.h"
+#include "x-tier/debug.h"
+
+
 MODULE_AUTHOR("Qumranet");
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("kvm module with x-tier support.");
 
 static unsigned int halt_poll_ns;
 module_param(halt_poll_ns, uint, S_IRUGO | S_IWUSR);
@@ -2209,6 +2217,11 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, u32 id)
 	smp_wmb();
 	atomic_inc(&kvm->online_vcpus);
 
+#ifdef CONFIG_KVM_XTIER
+	// initialize the associated xtier instance
+	xtier_init(&vcpu->xtier);
+#endif
+
 	mutex_unlock(&kvm->lock);
 	kvm_arch_vcpu_postcreate(vcpu);
 	return r;
@@ -2240,11 +2253,16 @@ static long kvm_vcpu_ioctl(struct file *filp,
 	struct kvm_fpu *fpu = NULL;
 	struct kvm_sregs *kvm_sregs = NULL;
 
+#ifdef CONFIG_KVM_XTIER
+	struct xtier_config xtier_config;
+	struct injection_arg *XTIER_arg_data = NULL;
+#endif
+
 	if (vcpu->kvm->mm != current->mm)
 		return -EIO;
 
-	if (unlikely(_IOC_TYPE(ioctl) != KVMIO))
-		return -EINVAL;
+	//if (unlikely(_IOC_TYPE(ioctl) != KVMIO))
+	//	return -EINVAL;
 
 #if defined(CONFIG_S390) || defined(CONFIG_PPC) || defined(CONFIG_MIPS)
 	/*
@@ -2424,6 +2442,138 @@ out_free1:
 		r = kvm_arch_vcpu_ioctl_set_fpu(vcpu, fpu);
 		break;
 	}
+#ifdef CONFIG_KVM_XTIER
+	case XTIER_IOCTL_SET_XTIER_STATE: {
+		if (copy_from_user(&xtier_config, argp, sizeof(struct xtier_config)))
+			goto out;
+
+		xtier_set_config(vcpu, &xtier_config);
+		r = 0;
+
+		break;
+	}
+	case XTIER_IOCTL_INJECT: {
+		// ioctl that triggers code injection into the VM.
+
+		PRINT_DEBUG("kvm recieved the injection ioctl!\n");
+		r = -1;
+
+		// if the currently loaded injection has had arguments, free them now.
+		if (vcpu->xtier.injection.argv) {
+			vfree(vcpu->xtier.injection.argv);
+			vcpu->xtier.injection.argv = NULL;
+		}
+
+		// if no injection struct was provided, just rerun the injection.
+		if (!argp) {
+			PRINT_DEBUG("running the injection without new injection information!\n");
+			xtier_inject(vcpu);
+			r = 0;
+			break;
+		}
+
+		// copy the new injection structure into the kernel.
+		if (copy_from_user(&vcpu->xtier.injection, argp, sizeof(struct injection))) {
+			PRINT_ERROR("copying the injection structure to the kernel failed.\n");
+			goto out;
+		}
+
+		// The injection code transfer can be skipped, since the
+		// userspace data will be available within kernel module (qemu
+		// invokes the ioctl call, which leads to the execution of the
+		// vm)
+
+		// Store the sent arguments
+
+		//remember the arg data location in userspace
+		XTIER_arg_data = vcpu->xtier.injection.argv;
+
+		if (vcpu->xtier.injection.argc > 0 && XTIER_arg_data) {
+			if (! (vcpu->xtier.injection.type & (CONSOLIDATED | CONSOLIDATED_ARGS))) {
+				PRINT_ERROR("arguments of injection to be inserted are not consolidated!\n");
+				goto out;
+			}
+
+			// alloc the arg data in kernel (that's why we remembered XTIER_arg_data)
+			// Use VMALLOC to be able to reserve large amounts of memory
+			vcpu->xtier.injection.argv = vmalloc(vcpu->xtier.injection.args_size);
+
+			r = -ENOMEM;
+			if (!vcpu->xtier.injection.argv) {
+				PRINT_ERROR("failed allocating memory for argument data!\n");
+				goto out;
+			}
+
+			// copy the argument data to the kernel
+			if (copy_from_user(vcpu->xtier.injection.argv, XTIER_arg_data, vcpu->xtier.injection.args_size)) {
+				PRINT_ERROR("failed copying injection argument data (user: 0x%p) to kernel (dest: 0x%p)!\n", XTIER_arg_data, vcpu->xtier.injection.argv);
+				goto out;
+			}
+
+			// as we copied the argument blob its own kernel memory,
+			// the injection type has changed.
+			vcpu->xtier.injection.type = CONSOLIDATED_ARGS;
+
+			// update pointers within the args
+			consolidated_update_arg_pointers(&vcpu->xtier.injection);
+		}
+
+		// This is a new module
+		vcpu->xtier.state.new_module = 1;
+
+		xtier_inject(vcpu);
+		r = 0;
+
+		break;
+	}
+	case XTIER_IOCTL_INJECT_RESERVE_MEMORY: {
+		u64 size = (u64)argp;
+
+		r = XTIER_inject_reserve_additional_memory(vcpu, (u32)(size & 0xffffffff));
+
+		break;
+	}
+	case XTIER_IOCTL_INJECT_SET_AUTO_INJECT: {
+		u32 auto_inject = (u32)(((u64)argp) & 0xffffffff);
+
+		XTIER_set_auto_inject(vcpu, auto_inject);
+		r = 0;
+
+		break;
+	}
+	case XTIER_IOCTL_INJECT_SET_TIME_INJECT: {
+		u32 time_inject = (u32)(((u64)argp) & 0xffffffff);
+
+		XTIER_set_time_inject(vcpu, time_inject);
+		r = 0;
+
+		break;
+	}
+	case XTIER_IOCTL_INJECT_GET_PERFORMANCE: {
+		r = -EFAULT;
+		if (copy_to_user(argp, &vcpu->xtier.stats, sizeof(struct xtier_stats)))
+			goto out;
+		r = 0;
+		break;
+	}
+	case XTIER_IOCTL_INJECT_GET_STATE: {
+		r = -EFAULT;
+		if (copy_to_user(argp, &vcpu->xtier.state, sizeof(struct xtier_state)))
+			goto out;
+		r = 0;
+		break;
+	}
+	case XTIER_IOCTL_INJECT_AVOID_IDLE_CR3: {
+		vcpu->xtier.cfg.mode |= XTIER_AVOID_IDLE;
+		r = 0;
+		break;
+	}
+	case XTIER_IOCTL_INJECT_CAPTURE_IDLE_CR3: {
+		vcpu->xtier.cfg.mode |= XTIER_CAPTURE_IDLE;
+		r = 0;
+		break;
+	}
+#endif
 	default:
 		r = kvm_arch_vcpu_ioctl(filp, ioctl, arg);
 	}
